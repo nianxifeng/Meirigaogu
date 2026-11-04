@@ -1,0 +1,16 @@
+[build]
+  publish = "."
+
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET,POST,OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type"
+    Cache-Control = "no-store"
+
+[[redirects]]
+  from = "/api/marks"
+  to = "https://gaogu-marks.gaogu-7q1x3d.workers.dev/marks"
+  status = 200
+  force = true
