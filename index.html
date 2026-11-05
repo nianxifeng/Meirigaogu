@@ -248,27 +248,44 @@ async function fetchRemote(){
   } catch (e) { return null; }
 }
 
-function buildPayload(){
-  // 清掉可能残留的 __devices 键，只上传标记本身
-  const clean = {};
-  for (const k of Object.keys(marks)) if (k !== "__devices" && marks[k]) clean[k] = marks[k];
-  return JSON.stringify(clean);
+const pending = new Map();
+let pushing = false;
+function queueChange(href){
+  if (href) pending.set(href, marks[href] || "");
 }
 
-function pushRemote(){
-  if (!SYNC_URL) return;
+async function flushChanges(){
+  if (!SYNC_URL || pushing || !pending.size) return;
+  pushing = true;
+  const batch = [...pending].slice(0, 500);
+  try {
+    const r = await fetch(SYNC_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ changes: Object.fromEntries(batch) }),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    for (const [href, value] of batch) if (pending.get(href) === value) pending.delete(href);
+    setSyncTip("已同步");
+  } catch (e) {
+    setSyncTip("同步失败（稍后重试）");
+  } finally {
+    pushing = false;
+    if (pending.size) pushRemote(3000);
+  }
+}
+
+function pushRemote(delay = 800){
+  if (!SYNC_URL || !pending.size) return;
   clearTimeout(pushTimer);
-  pushTimer = setTimeout(() => {
-    fetch(SYNC_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: buildPayload() })
-      .catch(() => setSyncTip("同步失败（离线？）"));
-  }, 800);
+  pushTimer = setTimeout(flushChanges, delay);
 }
 
-// 本机最近 30 秒改过的键，轮询不覆盖
+// KV 跨地区读取可能延迟；本机改动保留两分钟，直到远端确认。
 const touched = new Map();
 function markTouched(href){
   touched.set(href, Date.now());
-  setTimeout(() => { if (Date.now() - (touched.get(href) || 0) >= 29000) touched.delete(href); }, 30000);
+  queueChange(href);
+  setTimeout(() => { if (Date.now() - (touched.get(href) || 0) >= 119000) touched.delete(href); }, 120000);
 }
 
 async function syncOnStart(){
@@ -276,13 +293,17 @@ async function syncOnStart(){
   const rem = await fetchRemote();
   if (!rem) { setSyncTip("同步失败（离线？）"); return; }
   let changed = false;
+  let localOnly = 0;
+  for (const k of Object.keys(marks)) {
+    if (k !== "__devices" && marks[k] && !(k in rem.m)) {
+      markTouched(k); localOnly++;
+    }
+  }
   for (const k of Object.keys(rem.m)) {
-    if (!(k in marks) && rem.m[k]) { marks[k] = rem.m[k]; changed = true; }
+    if (pending.has(k) || marks[k] === rem.m[k]) continue;
+    marks[k] = rem.m[k]; changed = true;
   }
   if (changed) { saveLocal(); render(); }
-
-  let localOnly = 0;
-  for (const k of Object.keys(marks)) if (marks[k] && !(k in rem.m)) localOnly++;
 
   if (localOnly) {
     pushRemote();
@@ -300,9 +321,9 @@ function pullRemote(){
     for (const k of Object.keys(rem.m)) {
       const rv = rem.m[k], lv = marks[k];
       if (rv === lv) continue;
-      if (Date.now() - (touched.get(k) || 0) < 30000) continue;
-      if (!(k in marks)) { marks[k] = rv; changed = true; }
-      else if (rv) { marks[k] = rv; changed = true; }
+      if (pending.has(k)) continue;
+      if (Date.now() - (touched.get(k) || 0) < 120000) continue;
+      marks[k] = rv; changed = true;
     }
     if (changed) { saveLocal(); render(); }
     setSyncTip("已同步 " + new Date().toLocaleTimeString().slice(0, 5));
@@ -645,7 +666,7 @@ $("sales").addEventListener("click", (e) => {
   const kind = btn.dataset.k;
 
   if (kind === "clear") {
-    g.items.forEach(l => { marks[l.href] = ""; });
+    g.items.forEach(l => { marks[l.href] = ""; markTouched(l.href); });
     save(); render();
     return;
   }
@@ -721,7 +742,7 @@ $("importBtn").addEventListener("click", () => {
       const u = typeof x === "string" ? x : x.url || x.link || "";
       if (!u) return;
       const href = u.replace(/^https?:\/\/www\.invaluable\.com/, "");
-      marks[href] = val; n++;
+      marks[href] = val; markTouched(href); n++;
     });
   };
   apply(j.star || j.keep, "star");

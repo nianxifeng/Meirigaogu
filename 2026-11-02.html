@@ -27,6 +27,9 @@
   .chip[aria-pressed="true"]{background:var(--ink);color:#fff;border-color:var(--ink)}
   .chip .n{opacity:.55;margin-left:5px;font-variant-numeric:tabular-nums}
   .chip.mat[aria-pressed="true"]{background:var(--gold);border-color:var(--gold)}
+  /* 「新增被过滤」用金色区分，未激活时也有金色描边，方便找 */
+  .chip.nw{color:var(--gold);border-color:color-mix(in srgb,var(--gold) 45%,transparent)}
+  .chip.nw[aria-pressed="true"]{background:var(--gold);border-color:var(--gold);color:#fff}
   input[type=search]{border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:12.5px;
     min-width:230px;background:#faf9f7;outline:none}
   select{border:1px solid var(--line);border-radius:999px;padding:6px 10px;font-size:12.5px;background:#faf9f7}
@@ -245,27 +248,44 @@ async function fetchRemote(){
   } catch (e) { return null; }
 }
 
-function buildPayload(){
-  // 清掉可能残留的 __devices 键，只上传标记本身
-  const clean = {};
-  for (const k of Object.keys(marks)) if (k !== "__devices" && marks[k]) clean[k] = marks[k];
-  return JSON.stringify(clean);
+const pending = new Map();
+let pushing = false;
+function queueChange(href){
+  if (href) pending.set(href, marks[href] || "");
 }
 
-function pushRemote(){
-  if (!SYNC_URL) return;
+async function flushChanges(){
+  if (!SYNC_URL || pushing || !pending.size) return;
+  pushing = true;
+  const batch = [...pending].slice(0, 500);
+  try {
+    const r = await fetch(SYNC_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ changes: Object.fromEntries(batch) }),
+    });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    for (const [href, value] of batch) if (pending.get(href) === value) pending.delete(href);
+    setSyncTip("已同步");
+  } catch (e) {
+    setSyncTip("同步失败（稍后重试）");
+  } finally {
+    pushing = false;
+    if (pending.size) pushRemote(3000);
+  }
+}
+
+function pushRemote(delay = 800){
+  if (!SYNC_URL || !pending.size) return;
   clearTimeout(pushTimer);
-  pushTimer = setTimeout(() => {
-    fetch(SYNC_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: buildPayload() })
-      .catch(() => setSyncTip("同步失败（离线？）"));
-  }, 800);
+  pushTimer = setTimeout(flushChanges, delay);
 }
 
-// 本机最近 30 秒改过的键，轮询不覆盖
+// KV 跨地区读取可能延迟；本机改动保留两分钟，直到远端确认。
 const touched = new Map();
 function markTouched(href){
   touched.set(href, Date.now());
-  setTimeout(() => { if (Date.now() - (touched.get(href) || 0) >= 29000) touched.delete(href); }, 30000);
+  queueChange(href);
+  setTimeout(() => { if (Date.now() - (touched.get(href) || 0) >= 119000) touched.delete(href); }, 120000);
 }
 
 async function syncOnStart(){
@@ -273,13 +293,17 @@ async function syncOnStart(){
   const rem = await fetchRemote();
   if (!rem) { setSyncTip("同步失败（离线？）"); return; }
   let changed = false;
+  let localOnly = 0;
+  for (const k of Object.keys(marks)) {
+    if (k !== "__devices" && marks[k] && !(k in rem.m)) {
+      markTouched(k); localOnly++;
+    }
+  }
   for (const k of Object.keys(rem.m)) {
-    if (!(k in marks) && rem.m[k]) { marks[k] = rem.m[k]; changed = true; }
+    if (pending.has(k) || marks[k] === rem.m[k]) continue;
+    marks[k] = rem.m[k]; changed = true;
   }
   if (changed) { saveLocal(); render(); }
-
-  let localOnly = 0;
-  for (const k of Object.keys(marks)) if (marks[k] && !(k in rem.m)) localOnly++;
 
   if (localOnly) {
     pushRemote();
@@ -297,9 +321,9 @@ function pullRemote(){
     for (const k of Object.keys(rem.m)) {
       const rv = rem.m[k], lv = marks[k];
       if (rv === lv) continue;
-      if (Date.now() - (touched.get(k) || 0) < 30000) continue;
-      if (!(k in marks)) { marks[k] = rv; changed = true; }
-      else if (rv) { marks[k] = rv; changed = true; }
+      if (pending.has(k)) continue;
+      if (Date.now() - (touched.get(k) || 0) < 120000) continue;
+      marks[k] = rv; changed = true;
     }
     if (changed) { saveLocal(); render(); }
     setSyncTip("已同步 " + new Date().toLocaleTimeString().slice(0, 5));
@@ -429,7 +453,10 @@ function card(l){
 function renderMats(all){
   const counts = {};
   all.forEach(l => { const k = l.material || "其他"; counts[k] = (counts[k] || 0) + 1; });
-  const order = ["釉陶", "陶", "瓷", "青铜", "漆器", "玉石", "金银", "其他"];
+  // 「域外珠印」是固定栏目（域外印珠 / 宝石微雕戒面），没货也要占位，
+  // 否则新栏目在页面上直接消失，看不出来它存在
+  if (!counts["域外珠印"]) counts["域外珠印"] = 0;
+  const order = ["域外珠印", "釉陶", "陶", "瓷", "青铜", "漆器", "玉石", "金银", "其他"];
   const keys = Object.keys(counts).sort((a, b) => {
     const ia = order.indexOf(a), ib = order.indexOf(b);
     return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
@@ -495,10 +522,19 @@ function syncSelAll(){
 
 // ── 已过滤视图（按规则分组，不分页）──
 let rejFilterCat = "";
+// 只看本轮新增的被过滤条目（nw 由生成器写入：1 = 首次见到日期就是今天）
+let rejOnlyNew = false;
+
+const isNewRej = (r) => r && r.nw;
+
+function rejPool(){
+  const all = DATA.rejected || [];
+  return rejOnlyNew ? all.filter(isNewRej) : all;
+}
 
 function rejGroups(){
   const g = new Map();
-  for (const r of DATA.rejected || []) {
+  for (const r of rejPool()) {
     const cat = (r.why || "其他").replace(/[（(][^）)]*[）)]/g, "").trim() || "其他";
     if (!g.has(cat)) g.set(cat, []);
     g.get(cat).push(r);
@@ -519,12 +555,18 @@ function closeRejected(){
 }
 
 function renderRejPanel(){
+  const all = DATA.rejected || [];
+  const newTotal = all.filter(isNewRej).length;
   const groups = rejGroups();
-  const total = (DATA.rejected || []).length;
-  $("rejTitle").textContent = "共 " + total + " 条被过滤 · 按规则分组 · 不分页";
+  const total = rejPool().length;
+  $("rejTitle").textContent =
+    (rejOnlyNew ? "只看本轮新增 · " : "") + "共 " + total + " 条被过滤 · 按规则分组 · 不分页";
 
   $("rejChips").innerHTML =
-    '<button class="chip" data-c="" aria-pressed="' + (rejFilterCat === "" ? "true" : "false") + '">全部<span class="n">' + total + '</span></button>' +
+    '<button class="chip" data-c="" data-reset="1" aria-pressed="' +
+      (rejFilterCat === "" && !rejOnlyNew ? "true" : "false") + '">全部<span class="n">' + all.length + '</span></button>' +
+    '<button class="chip nw" data-n="1" aria-pressed="' + (rejOnlyNew ? "true" : "false") +
+      '" title="只看本轮首次出现的被过滤条目">新增被过滤<span class="n">' + newTotal + '</span></button>' +
     groups.map(([cat, arr]) =>
       '<button class="chip" data-c="' + cat.replace(/"/g, "&quot;") + '" aria-pressed="' +
       (rejFilterCat === cat ? "true" : "false") + '">' + cat + '<span class="n">' + arr.length + '</span></button>'
@@ -552,7 +594,9 @@ function renderRejPanel(){
     );
   }
   $("rejBody").innerHTML = parts.length ? parts.join("") : '<div class="rejempty">没有匹配的条目</div>';
-  $("rejTitle").textContent = "共 " + total + " 条被过滤 · 当前显示 " + shown + " 条 · 按规则分组 · 点卡片右上角 ☆ 可手动入选";
+  $("rejTitle").textContent =
+    (rejOnlyNew ? "只看本轮新增 · " : "") + "共 " + total + " 条被过滤 · 当前显示 " + shown +
+    " 条 · 按规则分组 · 点卡片右上角 ☆ 可手动入选";
 }
 
 function renderRejected(){
@@ -622,7 +666,7 @@ $("sales").addEventListener("click", (e) => {
   const kind = btn.dataset.k;
 
   if (kind === "clear") {
-    g.items.forEach(l => { marks[l.href] = ""; });
+    g.items.forEach(l => { marks[l.href] = ""; markTouched(l.href); });
     save(); render();
     return;
   }
@@ -658,9 +702,17 @@ $("reset").addEventListener("click", () => {
 $("rejEntry").addEventListener("click", openRejected);
 $("rejClose").addEventListener("click", closeRejected);
 $("rejChips").addEventListener("click", (e) => {
+  const n = e.target.closest(".chip[data-n]");
+  if (n) {
+    rejOnlyNew = !rejOnlyNew;
+    rejFilterCat = "";          // 切"新增"时回到全部分组，避免叠加后看起来是空的
+    renderRejPanel();
+    return;
+  }
   const b = e.target.closest(".chip[data-c]");
   if (!b) return;
   rejFilterCat = b.dataset.c || "";
+  if (b.dataset.reset) rejOnlyNew = false;   // 「全部」= 清掉所有筛选
   renderRejPanel();
 });
 $("rejQuery").addEventListener("input", () => renderRejPanel());
@@ -690,7 +742,7 @@ $("importBtn").addEventListener("click", () => {
       const u = typeof x === "string" ? x : x.url || x.link || "";
       if (!u) return;
       const href = u.replace(/^https?:\/\/www\.invaluable\.com/, "");
-      marks[href] = val; n++;
+      marks[href] = val; markTouched(href); n++;
     });
   };
   apply(j.star || j.keep, "star");
