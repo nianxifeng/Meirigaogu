@@ -225,8 +225,11 @@ const SYNC_URL = "https://meirigaogu.netlify.app/api/marks";
 let pushTimer = null;
 
 // —— 共享同步 ——
-// 云端结构：{ "<href>": "star"|"no"|"" }
+// 云端结构：{ version, marks: { "<href>": "star"|"no"|"" } }
+// 不做定时轮询：打开页面时拉一次全量；之后只在页面重新可见 / 获得焦点时，
+// 用 ?since=<版本号> 问一次有没有别人改过（没改只回几十字节），有改动才拉全量。
 // 读取时忽略历史遗留的 __devices 键
+let remoteVersion = 0;
 
 function splitRemote(raw){
   const m = {}, devs = {};
@@ -239,12 +242,17 @@ function splitRemote(raw){
   return { m, devs };
 }
 
-async function fetchRemote(){
+async function fetchRemote(since){
   if (!SYNC_URL) return null;
   try {
-    const r = await fetch(SYNC_URL, { cache: "no-store" });
+    const r = await fetch(SYNC_URL + "?since=" + (since || 0), { cache: "no-store" });
     if (!r.ok) return null;
-    return splitRemote(await r.json());
+    const j = await r.json();
+    if (j && typeof j.version === "number" && typeof j.changed === "boolean") {
+      if (!j.changed) return { unchanged: true, version: j.version };
+      return Object.assign(splitRemote(j.marks), { version: j.version });
+    }
+    return Object.assign(splitRemote(j), { version: 0 });   // 旧版后端：纯标记表
   } catch (e) { return null; }
 }
 
@@ -265,6 +273,12 @@ async function flushChanges(){
     });
     if (!r.ok) throw new Error("HTTP " + r.status);
     for (const [href, value] of batch) if (pending.get(href) === value) pending.delete(href);
+    let j = null;
+    try { j = await r.json(); } catch (e) {}
+    const v = j && typeof j.version === "number" ? j.version : 0;
+    // 版本只比本地多 1（或没变）= 只有自己这次写入，不用再拉；否则别人也改过，拉一次。
+    if (v && (v === remoteVersion + 1 || v === remoteVersion)) remoteVersion = v;
+    else if (v) pullRemote();
     setSyncTip("已同步");
   } catch (e) {
     setSyncTip("同步失败（稍后重试）");
@@ -290,8 +304,9 @@ function markTouched(href){
 
 async function syncOnStart(){
   if (!SYNC_URL) return;
-  const rem = await fetchRemote();
-  if (!rem) { setSyncTip("同步失败（离线？）"); return; }
+  const rem = await fetchRemote(0);
+  if (!rem || rem.unchanged) { setSyncTip("同步失败（离线？）"); return; }
+  remoteVersion = rem.version;
   let changed = false;
   let localOnly = 0;
   for (const k of Object.keys(marks)) {
@@ -313,10 +328,14 @@ async function syncOnStart(){
   }
 }
 
+let pulling = false;
 function pullRemote(){
-  if (!SYNC_URL) return Promise.resolve();
-  return fetchRemote().then((rem) => {
+  if (!SYNC_URL || pulling) return Promise.resolve();
+  pulling = true;
+  return fetchRemote(remoteVersion).then((rem) => {
     if (!rem) { setSyncTip("同步失败（离线？）"); return; }
+    if (rem.unchanged) { setSyncTip("已同步 " + new Date().toLocaleTimeString().slice(0, 5)); return; }
+    remoteVersion = rem.version;
     let changed = false;
     for (const k of Object.keys(rem.m)) {
       const rv = rem.m[k], lv = marks[k];
@@ -327,7 +346,16 @@ function pullRemote(){
     }
     if (changed) { saveLocal(); render(); }
     setSyncTip("已同步 " + new Date().toLocaleTimeString().slice(0, 5));
-  }).catch(() => setSyncTip("同步失败（离线？）"));
+  }).catch(() => setSyncTip("同步失败（离线？）")).finally(() => { pulling = false; });
+}
+
+// 回到页面时检查一次（3 秒内重复触发只算一次）
+let lastCheck = 0;
+function checkRemote(){
+  if (!SYNC_URL || document.visibilityState === "hidden") return;
+  if (Date.now() - lastCheck < 3000) return;
+  lastCheck = Date.now();
+  pullRemote();
 }
 
 function setSyncTip(t){
@@ -759,10 +787,12 @@ document.title = "高古上新 " + DATA.date;
 render();
 renderRejected();
 
-// 启动共享同步：先双向对齐，之后每 20 秒拉取别人的改动
+// 启动共享同步：先双向对齐；之后不轮询，只在回到页面时检查有没有新改动
 if (SYNC_URL) {
   syncOnStart();
-  setInterval(pullRemote, 20000);
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") checkRemote(); });
+  window.addEventListener("focus", checkRemote);
+  window.addEventListener("online", () => { lastCheck = 0; checkRemote(); pushRemote(); });
 }
 </script>
 </body>
